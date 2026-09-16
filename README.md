@@ -8,17 +8,19 @@ MPU6050으로 기울기를 재고, 상보필터로 각도를 추정한 뒤, 각�
 ## 데모
 
 <p align="center">
-  <a href="docs/evidence.mp4"><img src="docs/evidence.gif" width="260" alt="균형을 잡고 서 있는 로봇 (클릭하면 영상 재생)"></a>
+  <img src="docs/evidence.gif" width="260" alt="스스로 균형을 잡고 서 있는 로봇">
   &nbsp;&nbsp;
   <img src="image.png" width="330" alt="2층 구조의 밸런싱 로봇 전체 모습">
 </p>
 
 <p align="center">
-  <a href="docs/evidence.mp4">▶ 영상 보기 (H.264, 720p)</a> ·
-  <a href="evidence.mp4">원본 영상 (HEVC, 1080p)</a>
+  영상 내려받기:
+  <a href="docs/evidence.mp4?raw=true">H.264 720p (1.6 MB)</a> ·
+  <a href="evidence.mp4?raw=true">원본 HEVC 1080p (4.1 MB)</a>
 </p>
 
-> 원본 영상은 HEVC(H.265)라 크롬·엣지 등 일부 브라우저에서 재생되지 않을 수 있습니다. 그럴 때는 H.264 사본을 여세요.
+> GitHub는 레포에 들어 있는 mp4를 페이지 안에서 재생하지 않아서, 왼쪽 GIF를 미리보기로 넣었습니다.
+> 내려받은 영상은 H.264 쪽이 대부분의 플레이어에서 바로 재생됩니다. 원본(HEVC)은 Windows에서 코덱 확장이 필요할 수 있습니다.
 
 ---
 
