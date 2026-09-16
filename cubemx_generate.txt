@@ -1,0 +1,3 @@
+config load D:\stm_project\BalanceBot_F446ZE\BalanceBot_F446ZE.ioc
+project generate
+exit
