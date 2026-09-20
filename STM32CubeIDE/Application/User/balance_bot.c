@@ -78,6 +78,25 @@
 #define AUTO_ARM_STABLE_MS          1000U
 #define AUTO_ARM_MAX_RATE_DPS       30.0f
 
+/*
+ * Wheel-speed outer loop (quadrature encoders on TIM3 / TIM2).
+ *
+ * Balancing on angle alone cannot hold out indefinitely: the duty handed to a
+ * DC motor sets roughly its speed, so every correction leaves a little more
+ * speed behind in the same direction. It accumulates until the wheels are
+ * pinned at max RPM, at which point there is no headroom left to catch the
+ * next lean and the robot goes over. That is the 1-2 minute ceiling.
+ *
+ * So the outer loop watches wheel speed and tilts the angle target against it:
+ * rolling forward asks for a slight backward lean, which bleeds the speed off
+ * and restores headroom in both directions. Position is deliberately NOT
+ * regulated - the robot may drift, it just must not run out of speed.
+ *
+ * The offset is clamped hard: an outer loop that can command any lean it likes
+ * will lay the robot down while "correcting".
+ */
+#define ANGLE_OFFSET_MAX_DEG        3.0f
+
 typedef enum
 {
     BOT_BOOT = 0,
@@ -158,14 +177,18 @@ static int16_t motor_deadband = 130;
 static int16_t maximum_pwm = PWM_TIMER_MAX;
 
 /*
- * Mounting-dependent signs, confirmed on this build:
+ * Mounting-dependent signs. Wiring decides these, so re-check them after any
+ * rewire - both motor leads came back swapped the last time, which drove the
+ * wheels away from the fall instead of under it. No gain can rescue that.
+ *
  *   sensor_sign      leaning the MPU side (front) down must give ANG > 0
  *   left/right sign  TEST BOTH must roll both wheels toward the front
- * Flip at runtime with SSIGN / LSIGN / RSIGN if the hardware changes.
+ *
+ * Flip at runtime with SSIGN / LSIGN / RSIGN, then copy the values here.
  */
 static int8_t sensor_sign = -1;
-static int8_t left_motor_sign = -1;
-static int8_t right_motor_sign = 1;
+static int8_t left_motor_sign = 1;
+static int8_t right_motor_sign = -1;
 
 static uint32_t next_control_ms;
 static uint32_t last_telemetry_ms;
@@ -174,6 +197,40 @@ static bool previous_button_state;
 static uint8_t consecutive_mpu_errors;
 static uint32_t mpu_recoveries;
 static uint32_t mpu_clean_reads;
+static uint32_t mpu_recovery_total;   /* since boot, for comparing setups */
+static uint32_t mpu_last_i2c_error;   /* HAL_I2C_GetError at the failure */
+
+/* ---- Wheel-speed outer loop ---------------------------------------- */
+static TIM_HandleTypeDef htim_enc_left;
+static TIM_HandleTypeDef htim_enc_right;
+static bool encoders_ok;
+static uint16_t enc_prev_left;
+static uint16_t enc_prev_right;
+static float wheel_speed;          /* filtered, counts per 4 ms tick */
+static float angle_offset_deg;     /* what the outer loop is asking for */
+
+/*
+ * Starts at 0, i.e. outer loop disabled, so the first boot after wiring the
+ * encoders behaves exactly as before and SPD can be sanity-checked by hand.
+ * Raise it in small steps with KV once SPD reads correctly.
+ */
+static float kv = 0.0f;
+
+/*
+ * Smoothing on the speed estimate, as a plain exponential average. This has to
+ * be slow: an outer loop must be lazier than the loop it sits on top of, or it
+ * chases the robot's own rocking and ends up fighting the angle loop for the
+ * target. At 0.90 the time constant was 36 ms, fast enough that SPD flipped
+ * sign every few ticks; 0.98 puts it near 200 ms, so only sustained drift gets
+ * through. Adjust live with KVF.
+ */
+static float speed_filter_alpha = 0.98f;
+
+/* Which way each encoder counts when its wheel drives the robot forward.
+ * The motors face opposite ways, so these normally disagree. Set with
+ * ELSIGN / ERSIGN after watching SPD while rolling each wheel forward. */
+static int8_t encoder_left_sign = 1;
+static int8_t encoder_right_sign = -1;
 static uint32_t auto_arm_stable_ms;
 static bool auto_arm_inhibited;
 
@@ -191,7 +248,11 @@ static bool MpuRead(uint8_t reg, uint8_t *data, uint16_t length);
 static bool MpuReadRaw(MpuRaw *raw);
 static bool MpuConfigure(void);
 static void RecoveryHalfBit(void);
+static void I2cBusRelease(void);
 static bool MpuRecoverBus(void);
+static void EncodersInit(void);
+static void EncoderUpdateSpeed(void);
+static void EncoderResetBaseline(void);
 static bool MpuInitialize(void);
 static bool MpuCalibrate(void);
 static void UpdateControl(void);
@@ -234,6 +295,8 @@ void BalanceBot_Init(void)
     __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 0U);
     __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, 0U);
 
+    EncodersInit();
+
     if (HAL_UART_Receive_IT(&huart3, &uart_rx_byte, 1U) != HAL_OK)
     {
         Error_Handler();
@@ -244,6 +307,16 @@ void BalanceBot_Init(void)
         "Keep the robot still while MPU6050 calibrates...\r\n");
 
     SetState(BOT_BOOT);
+
+    /*
+     * Reset can land in the middle of an I2C read, and the MPU keeps holding
+     * SDA low afterwards waiting for clocks that the reset threw away. The MCU
+     * restarting does not clear that - only clocking the slave out of it does.
+     * Free the bus before probing, or every reset lands in MPU_FAULT and only
+     * a power cycle brings the sensor back.
+     */
+    I2cBusRelease();
+
     if (!MpuInitialize())
     {
         GPIO_InitTypeDef gpio_diagnostic = {0};
@@ -465,6 +538,120 @@ static bool MpuReadRaw(MpuRaw *raw)
 }
 
 /*
+ * Quadrature encoders, set up here rather than in CubeMX so that regenerating
+ * the .ioc cannot silently drop them, and so the whole control path stays in
+ * one file. TI12 counts all four edges for the finest resolution; the input
+ * filter is deliberately heavy because these lines run alongside motor wiring.
+ */
+static bool EncoderStart(TIM_HandleTypeDef *handle, TIM_TypeDef *instance)
+{
+    TIM_Encoder_InitTypeDef encoder = {0};
+
+    handle->Instance = instance;
+    handle->Init.Prescaler = 0U;
+    handle->Init.CounterMode = TIM_COUNTERMODE_UP;
+    /* Both counters wrap at 16 bits so the same signed delta works for the
+     * 32-bit TIM2 and the 16-bit TIM3. */
+    handle->Init.Period = 0xFFFFU;
+    handle->Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    handle->Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+
+    encoder.EncoderMode = TIM_ENCODERMODE_TI12;
+    encoder.IC1Polarity = TIM_ICPOLARITY_RISING;
+    encoder.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+    encoder.IC1Prescaler = TIM_ICPSC_DIV1;
+    encoder.IC1Filter = 10U;
+    encoder.IC2Polarity = TIM_ICPOLARITY_RISING;
+    encoder.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+    encoder.IC2Prescaler = TIM_ICPSC_DIV1;
+    encoder.IC2Filter = 10U;
+
+    if (HAL_TIM_Encoder_Init(handle, &encoder) != HAL_OK)
+    {
+        return false;
+    }
+    return HAL_TIM_Encoder_Start(handle, TIM_CHANNEL_ALL) == HAL_OK;
+}
+
+static void EncodersInit(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOE_CLK_ENABLE();
+    __HAL_RCC_TIM1_CLK_ENABLE();
+    __HAL_RCC_TIM3_CLK_ENABLE();
+
+    gpio.Mode = GPIO_MODE_AF_PP;
+    gpio.Pull = GPIO_PULLUP;          /* keeps the lines defined if unplugged */
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+
+    /* Left: PA6/PA7, labelled D12/D11 on the Arduino header. */
+    gpio.Pin = GPIO_PIN_6 | GPIO_PIN_7;
+    gpio.Alternate = GPIO_AF2_TIM3;
+    HAL_GPIO_Init(GPIOA, &gpio);
+
+    /*
+     * Right: PE9/PE11, labelled D6/D5. This started out on PA0/PA1 over on the
+     * morpho header, which got confused with the A0/A1 analog pins - and A0 is
+     * PA3, the motor driver's STBY line, so the encoder ended up fighting an
+     * MCU output. Both sides live on clearly numbered Arduino pins now.
+     */
+    gpio.Pin = GPIO_PIN_9 | GPIO_PIN_11;
+    gpio.Alternate = GPIO_AF1_TIM1;
+    HAL_GPIO_Init(GPIOE, &gpio);
+
+    encoders_ok = EncoderStart(&htim_enc_left, TIM3)
+               && EncoderStart(&htim_enc_right, TIM1);
+
+    EncoderResetBaseline();
+}
+
+/* Drop any speed accumulated while disarmed, so arming does not start with a
+ * stale offset already dialled in. */
+static void EncoderResetBaseline(void)
+{
+    if (!encoders_ok)
+    {
+        return;
+    }
+    enc_prev_left = (uint16_t)__HAL_TIM_GET_COUNTER(&htim_enc_left);
+    enc_prev_right = (uint16_t)__HAL_TIM_GET_COUNTER(&htim_enc_right);
+    wheel_speed = 0.0f;
+    angle_offset_deg = 0.0f;
+}
+
+static void EncoderUpdateSpeed(void)
+{
+    uint16_t now_left;
+    uint16_t now_right;
+    int16_t delta_left;
+    int16_t delta_right;
+    float raw;
+
+    if (!encoders_ok)
+    {
+        return;
+    }
+
+    now_left = (uint16_t)__HAL_TIM_GET_COUNTER(&htim_enc_left);
+    now_right = (uint16_t)__HAL_TIM_GET_COUNTER(&htim_enc_right);
+
+    /* Signed 16-bit difference handles wrap in either direction. */
+    delta_left = (int16_t)(now_left - enc_prev_left);
+    delta_right = (int16_t)(now_right - enc_prev_right);
+    enc_prev_left = now_left;
+    enc_prev_right = now_right;
+
+    /* Average of the two sides is forward travel; any yaw cancels out. */
+    raw = (((float)delta_left * (float)encoder_left_sign)
+         + ((float)delta_right * (float)encoder_right_sign)) * 0.5f;
+
+    wheel_speed = (speed_filter_alpha * wheel_speed)
+                + ((1.0f - speed_filter_alpha) * raw);
+}
+
+/*
  * Register setup only: no device reset, no long delays, so this is safe to
  * call from the control loop while recovering. PLL clock from X gyro,
  * 250 Hz output, DLPF around 44 Hz, gyro +/-500 dps, accelerometer +/-2 g.
@@ -498,7 +685,7 @@ static void RecoveryHalfBit(void)
  * Deliberately does not recalibrate the gyro or recapture the upright
  * reference: the robot is moving, so both would come out wrong.
  */
-static bool MpuRecoverBus(void)
+static void I2cBusRelease(void)
 {
     GPIO_InitTypeDef gpio = {0};
     uint32_t pulse;
@@ -531,6 +718,11 @@ static bool MpuRecoverBus(void)
     }
 
     MX_I2C1_Init();
+}
+
+static bool MpuRecoverBus(void)
+{
+    I2cBusRelease();
     return MpuConfigure();
 }
 
@@ -651,8 +843,13 @@ static void UpdateControl(void)
         return;
     }
 
+    /* Runs even while disarmed so SPD can be checked by hand before KV is
+     * ever raised above zero. */
+    EncoderUpdateSpeed();
+
     if (!MpuReadRaw(&raw))
     {
+        mpu_last_i2c_error = HAL_I2C_GetError(&hi2c1);
         consecutive_mpu_errors++;
         if (consecutive_mpu_errors < MPU_MAX_CONSECUTIVE_ERRORS)
         {
@@ -662,6 +859,7 @@ static void UpdateControl(void)
         consecutive_mpu_errors = 0U;
         mpu_clean_reads = 0U;
         mpu_recoveries++;
+        mpu_recovery_total++;
 
         if (mpu_recoveries > MPU_MAX_RECOVERIES)
         {
@@ -672,7 +870,24 @@ static void UpdateControl(void)
 
         if (MpuRecoverBus())
         {
-            UartTrySend("I2C: bus recovered\r\n");
+            /*
+             * The HAL error code says what actually went wrong, which decides
+             * where to look next:
+             *   0x04 AF      - no ACK. The sensor is not answering at all.
+             *   0x01 BERR    - misplaced START/STOP, i.e. corrupted bus.
+             *   0x02 ARLO    - arbitration lost, the line was pulled by
+             *                  something else - noise or contention.
+             *   0x20 TIMEOUT - the bus was held, usually SCL stretched.
+             * AF points at the module or its wiring; BERR/ARLO point at noise.
+             */
+            char message[64];
+            (void)snprintf(
+                message,
+                sizeof(message),
+                "I2C: bus recovered (err=0x%02lX, total=%lu)\r\n",
+                (unsigned long)mpu_last_i2c_error,
+                (unsigned long)mpu_recovery_total);
+            UartTrySend(message);
         }
         else
         {
@@ -755,8 +970,19 @@ static void UpdateControl(void)
     }
 
     {
-        float error = angle_deg - target_angle_deg;
+        /*
+         * Outer loop: lean against the accumulated wheel speed. Rolling
+         * forward (speed > 0) subtracts from the target, asking for a backward
+         * lean that bleeds the speed off. KV = 0 disables it entirely.
+         */
+        float error;
         float control;
+
+        angle_offset_deg = ClampFloat(
+            -kv * wheel_speed,
+            -ANGLE_OFFSET_MAX_DEG,
+            ANGLE_OFFSET_MAX_DEG);
+        error = angle_deg - (target_angle_deg + angle_offset_deg);
 
         integral_error += error * CONTROL_DT_S;
         integral_error =
@@ -882,6 +1108,7 @@ static void TryArm(void)
     StopMotorTest();
     integral_error = 0.0f;
     motor_output = 0;
+    EncoderResetBaseline();
     auto_arm_stable_ms = 0U;
     auto_arm_inhibited = false;   /* arming clears an earlier STOP */
     HAL_GPIO_WritePin(TB_STBY_GPIO_Port, TB_STBY_Pin, GPIO_PIN_SET);
@@ -894,6 +1121,7 @@ static void Disarm(BotState new_state)
     StopMotorTest();
     StopMotors();
     integral_error = 0.0f;
+    EncoderResetBaseline();
     SetState(new_state);
 }
 
@@ -1111,6 +1339,95 @@ static void ProcessSerialCommand(void)
         return;
     }
 
+    if (strncmp(command, "KV ", 3U) == 0)
+    {
+        float value;
+        if (ParseFloat(command + 3U, -5.0f, 5.0f, &value))
+        {
+            kv = value;
+            SendStatus();
+        }
+        else
+        {
+            UartTrySend("ERR: KV range -5..5 (0 disables the outer loop)\r\n");
+        }
+        return;
+    }
+    if (strncmp(command, "KVF ", 4U) == 0)
+    {
+        float value;
+        if (ParseFloat(command + 4U, 0.0f, 0.999f, &value))
+        {
+            speed_filter_alpha = value;
+            SendStatus();
+        }
+        else
+        {
+            UartTrySend("ERR: KVF range 0..0.999 (higher = slower)\r\n");
+        }
+        return;
+    }
+    if (strncmp(command, "ELSIGN ", 7U) == 0)
+    {
+        long value;
+        if (ParseLong(command + 7U, -1L, 1L, &value) && (value != 0L))
+        {
+            encoder_left_sign = (int8_t)value;
+            EncoderResetBaseline();
+            SendStatus();
+        }
+        else
+        {
+            UartTrySend("ERR: ELSIGN must be 1 or -1\r\n");
+        }
+        return;
+    }
+    if (strncmp(command, "ERSIGN ", 7U) == 0)
+    {
+        long value;
+        if (ParseLong(command + 7U, -1L, 1L, &value) && (value != 0L))
+        {
+            encoder_right_sign = (int8_t)value;
+            EncoderResetBaseline();
+            SendStatus();
+        }
+        else
+        {
+            UartTrySend("ERR: ERSIGN must be 1 or -1\r\n");
+        }
+        return;
+    }
+    if (strcmp(command, "ENC") == 0)
+    {
+        /* Raw counters, for working out counts-per-revolution by hand:
+         * note the value, turn a wheel exactly ten times, note it again. */
+        char message[96];
+
+        if (!encoders_ok)
+        {
+            UartTrySend("ENC: encoders failed to start\r\n");
+            return;
+        }
+        /*
+         * Pin levels come straight from IDR, which reads the pad whatever mode
+         * it is in. If the counters are stuck but these toggle as a wheel is
+         * turned, the timer is at fault; if they never move, the signal is not
+         * arriving; all zeros usually means the encoder has no power.
+         */
+        (void)snprintf(
+            message,
+            sizeof(message),
+            "ENC L=%ld R=%ld | D12=%u D11=%u D6=%u D5=%u\r\n",
+            (long)(uint16_t)__HAL_TIM_GET_COUNTER(&htim_enc_left),
+            (long)(uint16_t)__HAL_TIM_GET_COUNTER(&htim_enc_right),
+            (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_6) == GPIO_PIN_SET) ? 1U : 0U,
+            (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_7) == GPIO_PIN_SET) ? 1U : 0U,
+            (HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_9) == GPIO_PIN_SET) ? 1U : 0U,
+            (HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_11) == GPIO_PIN_SET) ? 1U : 0U);
+        UartTrySend(message);
+        return;
+    }
+
     if (strncmp(command, "TEST L ", 7U) == 0)
     {
         long value;
@@ -1198,17 +1515,25 @@ static void SendStatus(void)
     int32_t kp_x100 = (int32_t)(kp * 100.0f);
     int32_t ki_x100 = (int32_t)(ki * 100.0f);
     int32_t kd_x100 = (int32_t)(kd * 100.0f);
+    int32_t speed_x100 = (int32_t)(wheel_speed * 100.0f);
+    int32_t offset_cdeg = (int32_t)(angle_offset_deg * 100.0f);
+    int32_t kv_x1000 = (int32_t)(kv * 1000.0f);
 
     (void)snprintf(
         status,
         sizeof(status),
-        "S=%s ANG=%ld GYR=%ld OUT=%d TGT=%ld "
-        "KP=%ld KI=%ld KD=%ld DEAD=%d MAX=%d SS=%d LS=%d RS=%d\r\n",
+        "S=%s ANG=%ld GYR=%ld OUT=%d TGT=%ld SPD=%ld OFF=%ld REC=%ld KV=%ld KVF=%ld "
+        "KP=%ld KI=%ld KD=%ld DEAD=%d MAX=%d SS=%d LS=%d RS=%d ES=%d/%d\r\n",
         StateName(bot_state),
         (long)angle_cdeg,
         (long)gyro_cdps,
         (int)motor_output,
         (long)target_cdeg,
+        (long)speed_x100,
+        (long)offset_cdeg,
+        (long)mpu_recovery_total,
+        (long)kv_x1000,
+        (long)(int32_t)(speed_filter_alpha * 1000.0f),
         (long)kp_x100,
         (long)ki_x100,
         (long)kd_x100,
@@ -1216,15 +1541,17 @@ static void SendStatus(void)
         (int)maximum_pwm,
         (int)sensor_sign,
         (int)left_motor_sign,
-        (int)right_motor_sign);
+        (int)right_motor_sign,
+        (int)encoder_left_sign,
+        (int)encoder_right_sign);
     UartTrySend(status);
 }
 
 static void SendHelp(void)
 {
     UartTrySend(
-        "ARM STOP STATUS | KP/KI/KD n | TARGET n | DEAD n | MAXPWM n\r\n"
-        "SSIGN/LSIGN/RSIGN +/-1 | TEST L/R/BOTH n (-250..250, wheels raised)\r\n");
+        "ARM STOP STATUS ENC | KP/KI/KD/KV n | TARGET/DEAD/MAXPWM n\r\n"
+        "SSIGN/LSIGN/RSIGN/ELSIGN/ERSIGN +-1 | TEST L/R/BOTH n (raise wheels)\r\n");
 }
 
 static void UartTrySend(const char *text)
